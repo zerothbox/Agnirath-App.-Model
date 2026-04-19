@@ -1,0 +1,424 @@
+===================================================================================================
+LAYER 1 - INPUTS
+===================================================================================================
+
+
+
+struct CarConfig:
+  
+  mass_kg 
+  drag_coeff     // C_d
+  frontal_area 
+  rolling_resist // C_rr
+  air_density    = 1.10
+  motor_eta      = 0.9   
+  regen_eta      = 0.7 
+  battery_cap_wh = 5200
+
+struct LoopConfig:
+
+  // From the base route
+  arrive_soc_wh  // battery when we reach Zeerust
+  arrive_clock_s  // time when we reach Zeerust
+
+  // Stops
+  control_stop_s    = 1800     // mandatory 30-minute stop on arrival
+  inter_loop_stop_s = 300      // 5-minute stop between every loop
+
+  loop_length_m     = 35000
+
+  // Constraints
+  deadline_s        = 61200    // 5 PM
+  v_min_ms        
+  v_max_ms        
+  soc_min_wh        = 1040.0   // 20% of let's say 5200 Wh battery
+  delta_v_max       // To constraint velocity change between loops
+
+  // Derived quantities
+  loops_start_s     = arrive_clock_s + control_stop_s
+  time_available_s  = deadline_s - loops_start_s
+  soc_at_loop_start = arrive_soc_wh + solar_charging_during_stop
+
+
+struct LoopResult:
+
+  N_star          // final answer
+  velocities_ms   // optimal speed for each loop
+
+  // Update every loop
+  soc_after_drive  // battery at the end of the loop
+  soc_after_stop   // battery after the 5-min stop
+  t_loop_start     // time when the loop begins
+  t_loop_end       // time when the loop ends
+  avg_solar_w      // average solar power during the loop
+  net_energy_wh    // net battery change during the loop
+
+  // Derived quantities
+  total_dist_km   = N_star × 35
+  finish_time_s   = t_loop_end  // at the last loop
+  margin_s        = deadline_s - finish_time_s  // must be > 0
+
+
+
+===================================================================================================
+LAYER 2 - PHYSICS
+===================================================================================================
+
+
+
+// The loop is assumed flat at all points
+// This simplifies the power equation to just two terms: P_mech = k_aero × v³  +  k_roll × v
+
+
+function compute_flat_road_power(v_ms, car):
+
+  G = 9.81
+
+  // Drag 
+  k_aero  = 0.5 × car.air_density × car.drag_coeff × car.frontal_area
+  P_aero  = k_aero × v_ms^3
+
+  // Rolling resistance
+  k_roll  = car.rolling_resist × car.mass_kg × G
+  P_roll  = k_roll × v_ms
+
+  mech_power_w = P_aero + P_roll
+
+  return mech_power_w
+
+
+function compute_electrical_power_flat(v_ms, car):
+  // On flat, free road, power is always positive (drawing from battery), assuming minor changes in velocity does not provide much regen energy
+  P_mech = compute_flat_road_power(v_ms, car)
+  return P_mech / car.motor_eta
+
+
+function compute_solar_power(t, car):
+  // Retrieve datapoint at the corresponding timestamp from race_day_solar_data.csv
+
+
+function compute_stop_charging(t_start, duration, car):
+  // While the car sits still during a mandatory stop, the panels still collect sun.
+
+  energy_gained  // Summate the solar irradiance considering efficiency
+  return energy_gained
+
+
+function apply_stop(soc, t_start, duration, car):
+  // Add charging energy but never exceed the battery's maximum capacity.
+  gain = compute_stop_charging(t_start, duration, car)
+  new_soc = min(soc + gain, car.battery_cap_wh)
+  new_t = t_start + duration
+  return new_soc, new_t
+
+
+
+===================================================================================================
+LAYER 3 - FEASIBILITY
+===================================================================================================
+
+
+
+function newton_raphson_cubic(k, B, C, v_i):
+  // Start with a guess, step toward the root incrementally
+  v = v_i
+  for iteration = 1 to 60:
+    f  = k × v^3 - B × v + C
+    df = 3 × k × v^2 - B
+    step = f / df
+    v = v - step
+  return v
+
+
+//   TIME  constraint  -> v_min = N * L / T_avail
+//   ENERGY constraint -> solve cubic: k * v^3 - (η * ΔE/NL) * v + (P_loss - η * P_sol) = 0
+// If v_min > v_max, the optimizer will never find a feasible solution
+// We use this check before running the optimizer
+
+
+function compute_feasibility_window(N, soc_budget, t_start, loop, car):
+
+  L         = loop.loop_length_m
+  T_avail   = loop.time_available_s - (N - 1) × loop.inter_loop_stop_s
+  E_wh      = soc_budget - loop.soc_min_wh     // usable energy
+  E_joules  = E_wh × 3600                     // Wh to Joules
+  G         = 9.81
+  k_aero    = 0.5 × car.air_density × car.drag_coeff × car.frontal_area
+  k_roll    = car.rolling_resist × car.mass_kg × G
+
+  // TIME floor: min. speed
+  if T_avail <= 0:
+    return NOT_FEASIBLE
+  v_min_0 = (N × L) / T_avail
+
+  // ENERGY ceiling: max. speed
+  P_sol_approx
+
+  eta   = car.motor_eta
+  B     = (eta × E_joules) / (N × L)
+  C     = k_roll / eta - P_sol_approx × eta
+  v_max_0 = newton_raphson_cubic(k_aero, B, C, v_i = loop.v_max_ms)
+
+  // Check legal bounds
+  v_min = max(v_min_0, loop.v_min_ms)
+  v_max = min(v_max_0, loop.v_max_ms)
+
+  if v_min > v_max:
+    return NOT_FEASIBLE
+  return v_min, v_max
+
+
+function simulate_one_loop(v, soc, t_start, curr_loop, car):
+  // One loop, one speed
+
+  L            = curr_loop.loop_length_m
+  loop_time    = L / v       
+
+  P_solar
+  P_elec       = compute_electrical_power_flat(v, car)
+
+  net_power   = P_solar - P_elec
+  delta_soc  = net_power × loop_time / 3600.0
+
+  soc_after_drive = soc + delta_soc
+  t_loop_end    = t_start + loop_time
+
+  return:
+    soc_after_drive
+    t_loop_end
+    duration_s      = loop_time
+    avg_solar_w     = P_solar
+    avg_motor_w     = P_elec
+    net_energy_wh   = delta_soc
+
+
+function simulate_N_loops(velocities[], curr_loop, car):
+  // Simulate N loops in sequence, applying 5-min stops
+
+  N   = length(velocities)
+  soc = curr_loop.soc_at_loop_start 
+  t   = curr_loop.loops_start_s
+
+  results = new LoopResult(N)
+
+  for i = 0 to N-1:
+
+    results.t_loop_start[i] = t
+
+    loop_1 = simulate_one_loop(velocities[i], soc, t, curr_loop, car)
+
+    results.soc_after_drive[i] = loop_1.soc_after_drive
+    results.t_loop_end[i]      = loop_1.t_loop_end
+    results.avg_solar_w[i]     = loop_1.avg_solar_w
+    results.net_energy_wh[i]   = loop_1.net_energy_wh
+
+    soc = loop_1.soc_after_drive
+    t   = loop_1.t_loop_end
+
+    // Inter-loop stop
+    if i < N - 1:
+      soc, t = apply_stop(soc, t, curr_loop.inter_loop_stop_s, car)
+    results.soc_after_stop[i] = soc
+
+  results.finish_time_s = t
+  results.margin_s      = curr_loop.deadline_s - t
+  results.total_dist_km = N × curr_loop.loop_length_m / 1000
+  return results
+
+
+
+===================================================================================================
+LAYER 4 - OPTIMIZER
+===================================================================================================
+
+
+
+// Assuming exactly N loops, find the best speeds.
+//
+// Objective: minimise total DRIVE time = Σ (L / v[i])
+// Because:
+//   We want to fit N loops before 5 PM.
+//   If the minimum possible drive time + stop time fits in T_avail, N is feasible.
+//   We then try N+1, N+2... until no feasible N exists.
+//   The last feasible N is our answer
+
+
+function optimize_fixed_N(N, v_0, curr_loop, car):
+
+  L      = curr_loop.loop_length_m
+  t_stop = curr_loop.inter_loop_stop_s
+
+  // Objective
+  // Analytic gradient: dT/dv[i] = -L / v[i]^2  (same derivation as base race)
+  function objective(velocities):
+    return sum(L / v for v in velocities)
+  function objective_gradient(velocities):
+    return [-L / (v × v) for v in velocities]
+
+  // SOC must stay above 20%
+  function constraint_soc(velocities):
+    sim = simulate_N_loops(velocities, curr_loop, car)
+    return [sim.soc_after_drive[i] - curr_loop.soc_min_wh for i in 0..N-1]
+
+  // Must finish before 5 PM
+  function constraint_deadline(velocities):
+    T_drive = objective(velocities)
+    T_stops = (N - 1) × t_stop
+    time_used = T_drive + T_stops
+    return curr_loop.time_available_s - time_used   // >0 means it fits before deadline
+
+  // No sudden speed changes between loops
+  function constraint_acceleration(velocities):
+    return [curr_loop.delta_v_max - abs(velocities[i+1] - velocities[i]) for i in 0..N-2]
+
+  // Speeds must be in legal range
+  bounds = [(curr_loop.v_min_ms, curr_loop.v_max_ms)] × N
+
+  // Running SLSQP
+  result = SLSQP_minimize(
+    objective_fn   = objective,
+    gradient_fn    = objective_gradient,
+    initial_guess  = v_0,
+    bounds         = bounds,
+    constraints    = [
+      {constraint_soc},
+      {constraint_deadline},
+      {constraint_acceleration},
+    ],
+    iterations,
+    tolerance
+  )
+
+  // Verify the feasibility
+  v_opt = clip(result.x, curr_loop.v_min_ms, curr_loop.v_max_ms)
+  sim   = simulate_N_loops(v_opt, curr_loop, car)
+
+  s_ok  = min(sim.soc_after_drive) >= curr_loop.soc_min_wh
+  t_ok = sim.finish_time_s <= curr_loop.deadline_s
+  feasible = s_ok AND t_ok
+
+  return feasible, v_opt, sim
+
+
+//   1. Apply the control stop (30 min) to get starting SOC and time
+//   2. Increment: try 1, 2, 3, ...
+//      For each N, use algebraic bounds to determine plausibility
+//      Run SLSQP to verify if N is truly feasible
+//   5. The last N where SLSQP succeeds is our answer
+
+
+function maximize_loops(curr_loop, car):
+
+  // Apply the mandatory 30-minute stop
+  soc_after, t_after = apply_stop(
+    curr_loop.arrive_soc_wh,
+    curr_loop.arrive_clock_s,
+    curr_loop.control_stop_s,
+    car
+  )
+  curr_loop.soc_at_loop_start = soc_after
+  curr_loop.loops_start_s     = t_after
+  curr_loop.time_available_s  = curr_loop.deadline_s - curr_loop.loops_start_s
+
+  // Theoretical ceiling
+  N_max = floor(
+    (curr_loop.time_available_s + curr_loop.inter_loop_stop_s) /
+    (curr_loop.loop_length_m / curr_loop.v_max_ms + curr_loop.inter_loop_stop_s)
+  )
+
+  N_best   = 0
+  v_best   = []
+  sim_best = NULL
+
+  for N_try = 1 to N_max:
+
+    // Sanity check
+    window = compute_feasibility_window(
+      N_try,
+      curr_loop.soc_at_loop_start,
+      curr_loop.loops_start_s,
+      curr_loop, car
+    )
+
+    if window == NOT_FEASIBLE:
+      break     // no point trying N+1, N+2 because time/energy only gets tighter
+
+    // Warm-start: The midpoint of [v_min, v_max]
+    v_mid  = (window.v_min + window.v_max) / 2.0
+    v_init = [clamp(v_mid, curr_loop.v_min_ms, curr_loop.v_max_ms)] * N_try
+
+    // Run SLSQP
+    feasible, v_opt, sim = optimize_fixed_N(N_try, v_init, curr_loop, car)
+
+    if feasible:
+      N_best   = N_try
+      v_best   = v_opt
+      sim_best = sim
+
+    else:
+      break
+
+  return build_final_result(N_best, v_best, sim_best, curr_loop, car)
+
+
+
+===================================================================================================
+LAYER 5 - OUTPUT
+===================================================================================================
+
+
+
+// Building output dataframes to save to CSV.
+
+function build_final_result(N, v[], sim, curr_loop, car):
+
+  all_ok = TRUE
+
+  for i = 0 to N-1:
+    if v[i] > curr_loop.v_max_ms + 0.01:
+      
+      all_ok = FALSE
+    if sim.soc_after_drive[i] < curr_loop.soc_min_wh - 0.5:
+      
+      all_ok = FALSE
+    if sim.t_loop_end[i] > curr_loop.deadline_s:
+      
+      all_ok = FALSE
+
+  if N > 1:
+    max_dv = max(abs(v[i+1] - v[i]) for i in 0..N-2)
+    if max_dv > curr_loop.delta_v_max + 0.01:
+      
+      all_ok = FALSE
+
+  // Build per-loop summary CSV
+  rows = []
+  for i = 0 to N-1:
+    vi          = v[i]
+    t_start_i   = sim.t_loop_start[i]
+    t_end_i     = sim.t_loop_end[i]
+    duration_i  = curr_loop.loop_length_m / vi
+    t_mid_i     = t_start_i + duration_i / 2.0
+    soc_start_i = (curr_loop.soc_at_loop_start if i == 0 else sim.soc_after_stop[i-1])
+    soc_end_i   = sim.soc_after_drive[i]
+
+    P_sol  = compute_solar_power(t_mid_i, car)     // evaluated at loop midpoint
+    P_elec = compute_electrical_power_flat(vi, car)
+
+    rows.append({
+      loop_num          : i + 1,
+      t_start           : format_time(t_start_i),
+      t_end             : format_time(t_end_i),
+      duration_min      : duration_i / 60.0,
+      velocity_kmh      : vi × 3.6,
+      soc_start_pct     : soc_start_i / car.battery_cap_wh × 100,
+      soc_end_pct       : soc_end_i   / car.battery_cap_wh × 100,
+      soc_post_stop_pct : sim.soc_after_stop[i] / car.battery_cap_wh × 100,
+      avg_solar_w       : P_sol,
+      avg_motor_w       : P_elec,
+      net_energy_wh     : (P_sol - P_elec) × duration_i / 3600.0,
+    })
+
+  save_csv(rows, "loops_strategy.csv")
+
+  return sim
